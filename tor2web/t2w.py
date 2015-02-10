@@ -77,7 +77,6 @@ from tor2web.utils.stats import T2WStats
 from tor2web.utils.storage import Storage
 from tor2web.utils.templating import PageTemplate
 
-
 SOCKS_errors = {
     0x00: "error_sock_generic.tpl",
     0x23: "error_sock_hs_not_found.tpl",
@@ -359,11 +358,7 @@ class Agent(client.Agent):
         scheme = 'https' if is_https else 'http'
 
         for key, values in headers.getAllRawHeaders():
-            fixed_values = []
-            for value in values:
-                value = re_sub(rexp['w2t'], r'' + scheme + r'://\2.onion', value)
-                fixed_values.append(value)
-
+            fixed_values = [re_sub(rexp['w2t'], r'' + scheme + r'://\2.onion', value) for value in values]
             headers.setRawHeaders(key, fixed_values)
 
         try:
@@ -454,11 +449,14 @@ class T2WRequest(http.Request):
                 http://twistedmatrix.com/trac/ticket/6014
         """
         host = self.getHeader(b'host')
-        if host:
-            if host[0] == '[':
-                return host.split(']', 1)[0] + "]"
-            return networkString(host.split(':', 1)[0])
-        return networkString(self.getHost().host)
+        if not host:
+            return networkString(self.getHost().host)
+        if host[0] == '[':
+            return host.split(']', 1)[0] + "]"
+
+        # return everything before the ':'
+        return networkString(host.split(':', 1)[0])
+
 
     def forwardData(self, data, end=False):
         if not self.startedWriting:
@@ -475,6 +473,32 @@ class T2WRequest(http.Request):
         if data:
             self.write(data)
 
+    def getForwarders(self):
+        forwarders = []
+
+        try:
+            port = self.channel.transport.getPeer().port
+
+            xForwardedFor = self.requestHeaders.getRawHeaders("X-Forwarded-For")
+            for forwardHeader in xForwardedFor or []:
+                forwardList = forwardHeader.replace(" ", "").split(",")
+
+                for ip in forwardList:
+                    if isIPAddress(ip):
+                        forwarders.append(address.IPv4Address("TCP",
+                                                              ip.strip(),
+                                                              port))
+                    elif isIPv6Address(ip):
+                        forwarders.append(address.IPv6Address("TCP",
+                                                              ip.strip(),
+                                                              port))
+                    else:
+                        raise Exception
+        except:
+            return []
+
+        return forwarders
+
     def requestReceived(self, command, path, version):
         """
         Method overridden to reduce the function actions
@@ -482,9 +506,15 @@ class T2WRequest(http.Request):
         self.method, self.uri = command, path
         self.clientproto = version
 
-        # cache the client and server information, we'll need this later to be
-        # serialized and sent with the request so CGIs will work remotely
-        self.client = self.channel.transport.getPeer()
+        # we get the ip address of the user that can be:
+        #  - written in the x-forwared-for header if a proxy is in between
+        #  - the ip address of the transport endpoint
+        forwarders = self.getForwarders()
+        if forwarders:
+            self.client = forwarders[0]
+        else:
+            self.client = self.channel.transport.getPeer()
+
         self.host = self.channel.transport.getHost()
 
         self.process()
@@ -507,14 +537,13 @@ class T2WRequest(http.Request):
                 data = re_sub(self.translation_rexp['from'], self.translation_rexp['to'], data)
 
             proto = 'http://' if config.transport == 'HTTP' else 'https://'
-            data = re_sub(rexp['t2w'], proto + r'\2.' + config.basehost, data)
+            data = re_sub(rexp['html_t2w'], r'\1\2' + proto + r'\3.' + config.basehost + r'\4', data)
 
+            forward = data[:-500]
             if not self.header_injected and forward.find("<body") != -1:
                 banner = yield flattenString(self, templates['banner.tpl'])
                 forward = re.sub(rexp['body'], partial(self.add_banner, banner), forward)
                 self.header_injected = True
-
-            forward = data[:-500]
 
             self.forwardData(self.handleCleartextForwardPart(forward))
 
@@ -534,7 +563,7 @@ class T2WRequest(http.Request):
             data = re_sub(self.translation_rexp['from'], self.translation_rexp['to'], data)
 
         proto = 'http://' if config.transport == 'HTTP' else 'https://'
-        data = re_sub(rexp['t2w'], proto + r'\2.' + config.basehost, data)
+        data = re_sub(rexp['html_t2w'], r'\1\2' + proto + r'\3.' + config.basehost + r'\4', data)
 
         if not self.header_injected and data.find("<body") != -1:
             banner = yield flattenString(self, templates['banner.tpl'])
@@ -665,11 +694,12 @@ class T2WRequest(http.Request):
 
         self.obj.headers = req.headers
 
-        self.obj.headers.removeHeader(b'if-modified-since')
-        self.obj.headers.removeHeader(b'if-none-match')
+        # we remove the x-forwarded-for header that may contain a leaked ip
+        self.obj.headers.removeHeader(b'x-forwarded-for')
+
         self.obj.headers.setRawHeaders(b'host', [self.obj.onion])
         self.obj.headers.setRawHeaders(b'connection', [b'keep-alive'])
-        self.obj.headers.setRawHeaders(b'Accept-encoding', [b'gzip, chunked'])
+        self.obj.headers.setRawHeaders(b'accept-encoding', [b'gzip, chunked'])
         self.obj.headers.setRawHeaders(b'x-tor2web', [b'encrypted'])
 
         return True
@@ -844,9 +874,14 @@ class T2WRequest(http.Request):
             # we need to verify if the user is using tor;
             # on this condition it's better to redirect on the .onion
             if self.getClientIP() in tor_exits_list:
-                self.redirect("http://" + self.obj.onion + request.uri)
-                self.finish()
-                defer.returnValue(None)
+                self.setHeader(b'X-Check-Tor', b'true')
+                if not config.disable_tor_redirection:
+                    self.redirect("http://" + self.obj.onion + request.uri)
+                    self.finish()
+                    defer.returnValue(None)
+            else:
+                self.setHeader(b'X-Check-Tor', b'false')
+
 
             # Avoid image hotlinking
             if config.blockhotlinking and request.uri.lower().endswith(tuple(config.blockhotlinking_exts)):
@@ -961,6 +996,10 @@ class T2WRequest(http.Request):
 
         elif keyLower == 'cache-control':
             return
+
+        if keyLower == 'set-cookie':
+            values = [re_sub(rexp['set-cookie_t2w'],
+                             r'domain=\1\2.' + config.basehost + r'\3', x) for x in values]
 
         if keyLower in 'location':
 
@@ -1342,7 +1381,9 @@ ipv6 = config.listen_ipv6
 rexp = {
     'body': re.compile(r'(<body.*?\s*>)', re.I),
     'w2t': re.compile(r'(https.?:)?//([a-z0-9]{16}).' + config.basehost, re.I),
-    't2w': re.compile(r'(http.?:)?//([a-z0-9]{16}).onion', re.I)
+    't2w': re.compile(r'(http.?:)?//([a-z0-9]{16})\.onion', re.I),
+    'html_t2w': re.compile( r'(href|src|url|action)[\ ]*(=[\ ]*[\'"])http[s]?://([a-z0-9]{16})\.onion([\'"/])', re.I),
+    'set-cookie_t2w': re.compile(r'domain=(\.*)([a-z0-9]{16})\.onion(\b)?', re.I)
 }
 
 if 'T2W_FDS_HTTPS' not in os.environ and 'T2W_FDS_HTTP' not in os.environ:
