@@ -63,6 +63,7 @@ from twisted.web.iweb import IBodyProducer
 from twisted.python import log, logfile
 from twisted.python.compat import networkString, intToBytes
 from twisted.python.filepath import FilePath
+from twisted.python.log import err
 from twisted.internet.task import LoopingCall
 from tor2web import __version__
 from tor2web.utils.config import Config
@@ -76,6 +77,7 @@ from tor2web.utils.ssl import T2WSSLContextFactory, HTTPSVerifyingContextFactory
 from tor2web.utils.stats import T2WStats
 from tor2web.utils.storage import Storage
 from tor2web.utils.templating import PageTemplate
+from tor2web.utils.gettor import getRedirectURL, getOSandLC, processGetTorRequest
 
 SOCKS_errors = {
     0x00: "error_sock_generic.tpl",
@@ -725,7 +727,8 @@ class T2WRequest(http.Request):
                             isIPAddress(request.host) or \
                             isIPv6Address(request.host) or \
                             (config.overriderobotstxt and request.uri == '/robots.txt') or \
-                            request.uri.startswith('/antanistaticmap/')
+                            request.uri.startswith('/antanistaticmap/') or \
+                            request.uri.startswith('/GetTor')
 
         if content_length is not None:
             self.bodyProducer.length = int(content_length)
@@ -841,6 +844,58 @@ class T2WRequest(http.Request):
                     self.setHeader(b'content-type', 'text/plain')
                     defer.returnValue(self.contentFinish(''))
 
+                elif staticpath.startswith('GetTor'):
+                    # handle GetTor requests (files and signatures)
+
+                    client, lang = getOSandLC(
+                        self.requestHeaders,
+                        config.t2w_file_path('lists')
+                    )
+
+                    if client == 'iphone' or \
+                       client == 'android' or \
+                       client == 'torbrowser':
+                        self.redirect(getRedirectURL(client))
+                        self.finish()
+                        defer.returnValue(None)
+
+                    # for now just desktop users (Windows and OS X)
+                    elif client == 'windows' or client == 'osx':
+                        if staticpath == 'GetTor/file':
+                            type_req = 'file'
+
+                        elif staticpath == 'GetTor/signature':
+                            type_req = 'signature'
+                        
+                        # latest version of Tor Browser
+                        versions = List(
+                            config.t2w_file_path(
+                                'lists/latest_torbrowser.txt'
+                            )
+                        )
+                        
+                        for version in versions:
+                            latest_version = str(version)
+                        
+                        processGetTorRequest(
+                            self,
+                            client,
+                            lang,
+                            type_req,
+                            latest_version,
+                            config.t2w_file_path('torbrowser/latest/')
+                        )
+
+                    # likely Linux, BSD, etc.
+                    elif not client:
+                        self.setHeader(b'content-type', 'text/html')
+                        flattenString(
+                            self,
+                            templates['error_gettor.tpl']
+                        ).addCallback(self.contentFinish)
+
+                        defer.returnValue(NOT_DONE_YET)
+
                 else:
                     if type(antanistaticmap[staticpath]) == str:
                         filename, ext = os.path.splitext(staticpath)
@@ -851,6 +906,8 @@ class T2WRequest(http.Request):
                     elif type(antanistaticmap[staticpath]) == PageTemplate:
                         defer.returnValue(
                             flattenString(self, antanistaticmap[staticpath]).addCallback(self.contentFinish))
+                
+                
 
             except Exception:
                 pass
