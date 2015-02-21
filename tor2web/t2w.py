@@ -844,7 +844,7 @@ class T2WRequest(http.Request):
                     self.setHeader(b'content-type', 'text/plain')
                     defer.returnValue(self.contentFinish(''))
 
-                elif staticpath.startswith('gettor'):
+                elif not config.disable_gettor and staticpath.startswith('gettor'):
                     # handle GetTor requests (files and signatures)
 
                     clientOS, clientLang = getOSandLC(
@@ -1223,8 +1223,9 @@ def start_worker():
     ult = LoopingCall(updateListsTask)
     ult.start(600)
 
-    gtt = LoopingCall(getTorTask, config)
-    gtt.start(3600)
+    if not config.disable_gettor:
+        gtt = LoopingCall(getTorTask, config)
+        gtt.start(3600)
 
     # ##############################################################################
     # Static Data loading
